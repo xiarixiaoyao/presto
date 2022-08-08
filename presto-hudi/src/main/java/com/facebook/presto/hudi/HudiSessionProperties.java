@@ -27,6 +27,7 @@ import java.util.List;
 import static com.facebook.presto.hive.HiveSessionProperties.CACHE_ENABLED;
 import static com.facebook.presto.hive.HiveSessionProperties.dataSizeSessionProperty;
 import static com.facebook.presto.spi.session.PropertyMetadata.booleanProperty;
+import static com.facebook.presto.spi.session.PropertyMetadata.stringProperty;
 
 public class HudiSessionProperties
 {
@@ -37,6 +38,7 @@ public class HudiSessionProperties
     private static final String PARQUET_MAX_READ_BLOCK_SIZE = "parquet_max_read_block_size";
     private static final String PARQUET_BATCH_READ_OPTIMIZATION_ENABLED = "parquet_batch_read_optimization_enabled";
     private static final String PARQUET_BATCH_READER_VERIFICATION_ENABLED = "parquet_batch_reader_verification_enabled";
+    private static final String HOODIE_FILESYSTEM_VIEW_SPILLABLE_DIR = "hoodie_filesystem_view_spillable_dir";
 
     @Inject
     public HudiSessionProperties(HiveClientConfig hiveClientConfig, HudiConfig hudiConfig)
@@ -67,6 +69,11 @@ public class HudiSessionProperties
                         PARQUET_BATCH_READER_VERIFICATION_ENABLED,
                         "Is Parquet batch reader verification enabled? This is for testing purposes only, not to be used in production",
                         false,
+                        false),
+                stringProperty(
+                        HOODIE_FILESYSTEM_VIEW_SPILLABLE_DIR,
+                        "Path on local storage to use, when file system view is held in a spillable map.",
+                        "/tmp/",
                         false));
     }
 
@@ -93,5 +100,10 @@ public class HudiSessionProperties
     public static boolean isParquetBatchReaderVerificationEnabled(ConnectorSession session)
     {
         return session.getProperty(PARQUET_BATCH_READER_VERIFICATION_ENABLED, Boolean.class);
+    }
+
+    public static String getHoodieFilesystemViewSpillableDir(ConnectorSession session)
+    {
+        return session.getProperty(HOODIE_FILESYSTEM_VIEW_SPILLABLE_DIR, String.class);
     }
 }

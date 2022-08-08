@@ -110,7 +110,7 @@ public class HudiPageSourceProvider
                     getParquetMaxReadBlockSize(session),
                     isParquetBatchReadsEnabled(session),
                     isParquetBatchReaderVerificationEnabled(session),
-                    TupleDomain.all(), // TODO: predicates
+                    HudiPredicates.from(layout.getTupleDomain()).getRegularColumnPredicates(),
                     fileFormatDataSourceStats,
                     false);
         }

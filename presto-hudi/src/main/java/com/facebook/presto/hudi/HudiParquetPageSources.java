@@ -211,6 +211,7 @@ class HudiParquetPageSources
             // skip looking up predicates for complex types as Parquet only stores stats for primitives
             if (!baseType.equals(StandardTypes.MAP) && !baseType.equals(StandardTypes.ARRAY) && !baseType.equals(StandardTypes.ROW)) {
                 RichColumnDescriptor descriptor = descriptorsByPath.get(ImmutableList.of(columnHandle.getName()));
+                // TODO: support push down subfield
                 if (descriptor != null) {
                     predicate.put(descriptor, domain);
                 }

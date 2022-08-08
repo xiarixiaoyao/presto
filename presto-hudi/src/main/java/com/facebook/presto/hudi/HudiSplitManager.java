@@ -17,6 +17,7 @@ package com.facebook.presto.hudi;
 import com.facebook.presto.hive.HdfsContext;
 import com.facebook.presto.hive.HdfsEnvironment;
 import com.facebook.presto.hive.filesystem.ExtendedFileSystem;
+import com.facebook.presto.hive.metastore.Column;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.MetastoreContext;
 import com.facebook.presto.hive.metastore.Partition;
@@ -29,6 +30,7 @@ import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.connector.ConnectorSplitManager;
 import com.facebook.presto.spi.connector.ConnectorTransactionHandle;
 import com.facebook.presto.spi.schedule.NodeSelectionStrategy;
+import com.google.common.base.Verify;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Streams;
@@ -42,6 +44,7 @@ import org.apache.hudi.common.table.HoodieTableMetaClient;
 import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
 import org.apache.hudi.common.table.view.HoodieTableFileSystemView;
+import org.apache.hudi.common.util.Option;
 
 import javax.inject.Inject;
 
@@ -49,6 +52,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static com.facebook.presto.hive.metastore.MetastoreUtil.extractPartitionValues;
 import static com.facebook.presto.hudi.HudiErrorCode.HUDI_FILESYSTEM_ERROR;
@@ -91,24 +95,56 @@ public class HudiSplitManager
         HudiTableLayoutHandle layout = (HudiTableLayoutHandle) layoutHandle;
         HudiTableHandle table = layout.getTable();
 
+        // Load Hudi metadata
+        ExtendedFileSystem fs = getFileSystem(session, table);
+        boolean hudiMetadataTableEnabled = isHudiMetadataTableEnabled(session);
+        HoodieMetadataConfig metadataConfig = HoodieMetadataConfig.newBuilder().enable(hudiMetadataTableEnabled).build();
+        Configuration conf = fs.getConf();
+        HoodieTableMetaClient metaClient = HoodieTableMetaClient
+                .builder()
+                .setConf(conf)
+                .setBasePath(table.getPath())
+                .build();
+
         // Retrieve and prune partitions
-        List<String> partitions = hudiPartitionManager.getEffectivePartitions(session, metastore, table.getSchemaName(), table.getTableName(), layout.getTupleDomain());
+        List<String> partitions = hudiPartitionManager.getEffectivePartitions(session, metastore, metaClient, table.getSchemaName(), table.getTableName(), layout.getTupleDomain());
         if (partitions.isEmpty()) {
             return new FixedSplitSource(ImmutableList.of());
         }
 
-        // Load Hudi metadata
-        ExtendedFileSystem fs = getFileSystem(session, table);
-        HoodieMetadataConfig metadataConfig = HoodieMetadataConfig.newBuilder().enable(isHudiMetadataTableEnabled(session)).build();
-        Configuration conf = fs.getConf();
-        HoodieTableMetaClient metaClient = HoodieTableMetaClient.builder().setConf(conf).setBasePath(table.getPath()).build();
         HoodieTimeline timeline = metaClient.getActiveTimeline().getCommitsTimeline().filterCompletedInstants();
         String timestamp = timeline.lastInstant().map(HoodieInstant::getTimestamp).orElse(null);
         if (timestamp == null) {
             // no completed instant for current table
             return new FixedSplitSource(ImmutableList.of());
         }
+
         HoodieLocalEngineContext engineContext = new HoodieLocalEngineContext(conf);
+        // if metadata table enabled, support data skipping.
+        if (hudiMetadataTableEnabled) {
+            MetastoreContext metastoreContext = toMetastoreContext(session);
+            Optional<Table> hiveTableOpt = metastore.getTable(metastoreContext, table.getSchemaName(), table.getTableName());
+            Verify.verify(hiveTableOpt.isPresent());
+            HudiMetaTableBaseFilesManager hudiMetaTableBaseFilesManager = new HudiMetaTableBaseFilesManager(
+                    partitions,
+                    HudiSessionProperties.getHoodieFilesystemViewSpillableDir(session),
+                    engineContext,
+                    metaClient,
+                    HudiMetaTableBaseFilesManager.getQueryType(session, hiveTableOpt.get().getStorage().getStorageFormat().getInputFormat()),
+                    Option.empty());
+            ImmutableList.Builder<HudiSplit> splitsBuilder = ImmutableList.builder();
+            Map<String, HudiPartition> hudiPartitionMap = getHudiPartitions(hiveTableOpt.get(), layout, partitions);
+            hudiMetaTableBaseFilesManager.listQueryFiles(layout.getTupleDomain())
+                    .entrySet()
+                    .stream()
+                    .flatMap(entry -> entry.getValue().stream().map(fileSlice -> createHudiSplit(table, fileSlice, timestamp, hudiPartitionMap.get(entry.getKey()))))
+                    .filter(Optional::isPresent)
+                    .map(Optional::get)
+                    .forEach(splitsBuilder::add);
+            List<HudiSplit> splitsList = splitsBuilder.build();
+            return splitsList.isEmpty() ? new FixedSplitSource(ImmutableList.of()) : new FixedSplitSource(splitsList);
+        }
+
         HoodieTableFileSystemView fsView = createInMemoryFileSystemViewWithTimeline(engineContext, metaClient, metadataConfig, timeline);
 
         // Construct Presto splits
@@ -125,7 +161,8 @@ public class HudiSplitManager
                     .map(Optional::get)
                     .forEach(builder::add);
         }
-        return new FixedSplitSource(builder.build());
+        List<HudiSplit> splitList = builder.build();
+        return splitList.isEmpty() ? new FixedSplitSource(ImmutableList.of()) : new FixedSplitSource(splitList);
     }
 
     private ExtendedFileSystem getFileSystem(ConnectorSession session, HudiTableHandle table)
@@ -161,6 +198,24 @@ public class HudiSplitManager
                 logFiles,
                 ImmutableList.of(),
                 NodeSelectionStrategy.NO_PREFERENCE));
+    }
+
+    private Map<String, HudiPartition> getHudiPartitions(Table table, HudiTableLayoutHandle tableLayout, List<String> partitions)
+    {
+        List<Column> partitionColumns = table.getPartitionColumns();
+
+        Map<String, Map<String, String>> partitionMap = HudiPartitionManager
+                .getPartitions(partitionColumns.stream().map(f -> f.getName()).collect(Collectors.toList()), partitions);
+        if (partitions.size() == 1 && partitions.get(0).isEmpty()) {
+            // non-non-partitioned
+            return ImmutableMap.of(partitions.get(0), new HudiPartition(partitions.get(0), ImmutableList.of(), ImmutableMap.of(), table.getStorage(), tableLayout.getDataColumns()));
+        }
+        ImmutableMap.Builder<String, HudiPartition> builder = ImmutableMap.builder();
+        partitionMap.entrySet().stream().map(entry -> {
+            List<String> partitionValues = extractPartitionValues(entry.getKey());
+            return new HudiPartition(entry.getKey(), partitionValues, entry.getValue(), table.getStorage(), fromDataColumns(table.getDataColumns()));
+        }).forEach(p -> builder.put(p.getName(), p));
+        return builder.build();
     }
 
     public static HudiPartition getHudiPartition(ExtendedHiveMetastore metastore, MetastoreContext context, HudiTableLayoutHandle tableLayout, String partitionName)

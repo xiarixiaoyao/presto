@@ -27,6 +27,8 @@ import com.facebook.presto.common.type.VarbinaryType;
 import com.facebook.presto.common.type.VarcharType;
 import com.facebook.presto.spi.ConnectorPageSource;
 import com.facebook.presto.spi.PrestoException;
+import org.joda.time.format.DateTimeFormatter;
+import org.joda.time.format.ISODateTimeFormat;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -34,6 +36,7 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
@@ -63,6 +66,7 @@ public class HudiPageSource
     private final Block[] prefilledBlocks;
     private final int[] delegateIndexes;
     private final ConnectorPageSource delegate;
+    private static final DateTimeFormatter DATE_FORMATTER = ISODateTimeFormat.date().withZoneUTC();
 
     public HudiPageSource(
             List<HudiColumnHandle> columns,
@@ -219,7 +223,7 @@ public class HudiPageSource
                 return parseDouble(valueString);
             }
             if (type.equals(DATE)) {
-                return parseLong(valueString);
+                return TimeUnit.MILLISECONDS.toDays(DATE_FORMATTER.parseMillis(valueString));
             }
             if (type instanceof VarcharType) {
                 return utf8Slice(valueString);
